@@ -110,6 +110,18 @@ class GitHubClient:
                 return files
             page += 1
 
+    def list_review_comments(self, repo: str, number: int) -> list[dict]:
+        """All inline review comments on the PR (used to avoid re-posting the same issue)."""
+        comments: list[dict] = []
+        for page in range(1, 31):
+            r = self.http.get(f"/repos/{repo}/pulls/{number}/comments", params={"per_page": 100, "page": page})
+            r.raise_for_status()
+            batch = r.json()
+            comments.extend(batch)
+            if len(batch) < 100:
+                break
+        return comments
+
     def get_file_content(self, repo: str, path: str, ref: str) -> str | None:
         r = self.http.get(f"/repos/{repo}/contents/{path}", params={"ref": ref})
         if r.status_code == 404:

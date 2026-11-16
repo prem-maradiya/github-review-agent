@@ -46,6 +46,22 @@ def added_lines(patch: str) -> set[int]:
     return lines
 
 
+def new_line_texts(patch: str) -> dict[int, str]:
+    """Map each commentable new-file line number to its text (without the +/space prefix)."""
+    texts: dict[int, str] = {}
+    new_ln = 0
+    for raw in patch.splitlines():
+        m = HUNK_RE.match(raw)
+        if m:
+            new_ln = int(m.group(3))
+            continue
+        if raw.startswith("\\") or raw.startswith("-"):
+            continue
+        texts[new_ln] = raw[1:]
+        new_ln += 1
+    return texts
+
+
 def number_patch(patch: str) -> str:
     """Prefix each new-side line with its line number, e.g. `  42 +foo()`.
 

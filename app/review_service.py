@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import logging
+import re
 from collections import Counter
 
 from app.ast_analyzer import analyze_python
 from app.config import Settings
-from app.diff_parser import added_lines, commentable_lines
+from app.diff_parser import added_lines, commentable_lines, new_line_texts
 from app.github_client import GitHubClient
 from app.llm_reviewer import LLMReviewer
 from app.models import SEVERITY_EMOJI, SEVERITY_RANK, FileDiff, Finding, Severity
@@ -15,6 +17,9 @@ from app.repo_config import CONFIG_PATH, apply_repo_config, parse_repo_config
 
 log = logging.getLogger(__name__)
 MARKER = "<!-- ai-code-review-agent -->"
+FINGERPRINT_RE = re.compile(r"<!-- ai-review:([0-9a-f]{16}) -->")
+# Comments posted before fingerprints existed: "🚨 **Title** · `critical` · _security_ · static analysis"
+LEGACY_RE = re.compile(r"^\S+ \*\*.+?\*\* · `\w+` · _([\w-]+)_ · (?:static analysis|AI review)")
 
 
 def is_ignored(path: str, patterns: list[str]) -> bool:
@@ -56,14 +61,35 @@ def merge_findings(files: list[FileDiff], ast_findings: list[Finding], llm_findi
         seen.add(key)
         merged.append(f)
     merged.sort(key=lambda f: (-SEVERITY_RANK[f.severity], f.path, f.line))
-    return merged[: settings.max_comments]
+    return merged
 
 
-def format_comment(f: Finding) -> str:
+def fingerprint(f: Finding, line_text: str) -> str:
+    """Identity of an issue that survives line shifts: same file, same kind of issue, same code."""
+    raw = f"{f.path}|{f.category}|{' '.join(line_text.split())}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def already_posted(existing_comments: list[dict]) -> tuple[set[str], set[tuple[str, int, str]]]:
+    """Fingerprints of our earlier comments, plus (path, line, category) for pre-fingerprint ones."""
+    fingerprints: set[str] = set()
+    legacy: set[tuple[str, int, str]] = set()
+    for c in existing_comments:
+        body = c.get("body") or ""
+        if m := FINGERPRINT_RE.search(body):
+            fingerprints.add(m.group(1))
+        elif (m := LEGACY_RE.match(body)) and c.get("line"):
+            legacy.add((c["path"], c["line"], m.group(1)))
+    return fingerprints, legacy
+
+
+def format_comment(f: Finding, fp: str = "") -> str:
     tag = "static analysis" if f.source == "ast" else "AI review"
     body = f"{SEVERITY_EMOJI[f.severity]} **{f.title}** · `{f.severity.value}` · _{f.category}_ · {tag}\n\n{f.body}"
     if f.suggestion.strip():
         body += f"\n\n```suggestion\n{f.suggestion.rstrip()}\n```"
+    if fp:
+        body += f"\n\n<!-- ai-review:{fp} -->"  # hidden; lets re-reviews skip this issue
     return body
 
 
@@ -81,13 +107,18 @@ def check_conclusion(findings: list[Finding], fail_on: str) -> tuple[str, str]:
 
 
 def format_summary(llm_summary: str, findings: list[Finding], files: list[FileDiff], skipped: list[str],
-                   config_warning: str | None = None) -> str:
+                   config_warning: str | None = None, new_comments: int | None = None) -> str:
     counts = Counter(f.severity for f in findings)
     lines = [MARKER, "## 🤖 AI Code Review", ""]
     if config_warning:
         lines += [f"> ⚠️ {config_warning}", ""]
     lines += [llm_summary or "_No AI summary._", ""]
-    lines.append(f"Reviewed **{len(files)}** file(s), left **{len(findings)}** comment(s).")
+    if new_comments is None or new_comments == len(findings):
+        lines.append(f"Reviewed **{len(files)}** file(s), left **{len(findings)}** comment(s).")
+    else:
+        repeat = len(findings) - new_comments
+        lines.append(f"Reviewed **{len(files)}** file(s): **{new_comments}** new comment(s); "
+                     f"**{repeat}** issue(s) reported earlier are still present (not re-posted).")
     if findings:
         lines += ["", "| Severity | Count |", "|---|---|"]
         for sev in sorted(counts, key=lambda s: -SEVERITY_RANK[s]):
@@ -130,12 +161,21 @@ def review_pull_request(settings: Settings, repo: str, number: int, head_sha: st
         if settings.llm_enabled:
             llm_summary, llm_findings = LLMReviewer(settings).review(title, body, files, ast_findings)
 
-        # 3) Merge, dedupe, rank, and post a single review
+        # 3) Merge, dedupe, rank; skip issues already commented on in earlier reviews
         findings = merge_findings(files, ast_findings, llm_findings, settings)
-        comments = [{"path": f.path, "line": f.line, "side": "RIGHT", "body": format_comment(f)} for f in findings]
-        summary = format_summary(llm_summary, findings, files, skipped, config_warning)
+        texts = {f.path: new_line_texts(f.patch) for f in files}
+        posted_fps, posted_legacy = already_posted(gh.list_review_comments(repo, number))
+        comments = []
+        for f in findings:
+            fp = fingerprint(f, texts[f.path].get(f.line, ""))
+            if fp in posted_fps or (f.path, f.line, f.category) in posted_legacy:
+                continue
+            comments.append({"path": f.path, "line": f.line, "side": "RIGHT", "body": format_comment(f, fp)})
+        comments = comments[: settings.max_comments]
+        summary = format_summary(llm_summary, findings, files, skipped, config_warning, new_comments=len(comments))
         review = gh.create_review(repo, number, head_sha, summary, comments)
-        log.info("Posted review %s on %s#%s with %d comments", review.get("id"), repo, number, len(comments))
+        log.info("Posted review %s on %s#%s with %d new comments (%d issues already posted)",
+                 review.get("id"), repo, number, len(comments), len(findings) - len(comments))
 
         # 4) Report a pass/fail check on the PR
         conclusion, check_title = check_conclusion(findings, settings.fail_on)

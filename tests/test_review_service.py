@@ -17,6 +17,10 @@ class FakeGitHub:
     repo_config: str | None = None
     posted = None
     checks: list = []
+    existing_comments: list = []
+
+    def list_review_comments(self, repo, number):
+        return FakeGitHub.existing_comments
 
     def __init__(self, settings, installation_id):
         FakeGitHub.checks = []
@@ -71,6 +75,7 @@ def fakes(monkeypatch):
     monkeypatch.setattr(review_service, "LLMReviewer", FakeLLM)
     FakeGitHub.repo_config = None
     FakeGitHub.posted = None
+    FakeGitHub.existing_comments = []
     return Settings(github_webhook_secret="s", github_token="t")
 
 
@@ -119,6 +124,36 @@ def test_failure_marks_check_neutral(fakes, monkeypatch):
     with pytest.raises(RuntimeError):
         run(fakes)
     assert FakeGitHub.checks[-1][:3] == ("finish", 555, "neutral")
+
+
+def test_rereview_skips_already_posted_issues(fakes):
+    run(fakes)
+    first = FakeGitHub.posted["comments"]
+    assert all("<!-- ai-review:" in c["body"] for c in first)
+
+    # Second review of the same code: GitHub now returns the first review's comments
+    FakeGitHub.existing_comments = first
+    result = run(fakes)
+    assert result["comments"] == 0
+    assert FakeGitHub.posted["comments"] == []
+    assert "**2** issue(s) reported earlier are still present" in FakeGitHub.posted["body"]
+    # The check still reflects every current issue, not just new ones
+    assert FakeGitHub.checks[-1][3] == "1 high, 1 medium"
+
+
+def test_rereview_recognises_comments_from_before_fingerprints(fakes):
+    legacy = {"path": "app/run.py", "line": 2,
+              "body": "🔴 **Use of `eval()`** · `high` · _security_ · static analysis\n\nold body"}
+    FakeGitHub.existing_comments = [legacy]
+    run(fakes)
+    assert [c["line"] for c in FakeGitHub.posted["comments"]] == [1]  # only the new medium issue
+
+
+def test_fingerprint_survives_line_shift():
+    a = Finding(path="a.py", line=3, severity=Severity.high, category="security", title="t", body="b")
+    b = a.model_copy(update={"line": 9, "title": "reworded by the LLM"})
+    assert review_service.fingerprint(a, "  x = eval(s)") == review_service.fingerprint(b, "x = eval(s)")
+    assert review_service.fingerprint(a, "x = eval(s)") != review_service.fingerprint(a, "y = eval(s)")
 
 
 def test_min_severity_filter():

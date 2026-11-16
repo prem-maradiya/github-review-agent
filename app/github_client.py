@@ -12,11 +12,16 @@ from app.config import Settings
 
 log = logging.getLogger(__name__)
 
+CHECK_NAME = "AI Code Review"
+# Check-run conclusion -> commit-status state (PAT fallback; the Checks API needs a GitHub App)
+STATUS_STATE = {"success": "success", "failure": "failure", "neutral": "error"}
+
 
 class GitHubClient:
     def __init__(self, settings: Settings, installation_id: int | None = None):
         self.settings = settings
         self.base = settings.github_api_url.rstrip("/")
+        self.is_app = False
         token = self._resolve_token(installation_id)
         self.http = httpx.Client(
             base_url=self.base,
@@ -43,12 +48,56 @@ class GitHubClient:
                 timeout=30.0,
             )
             r.raise_for_status()
+            self.is_app = True
             return r.json()["token"]
         if self.settings.github_token:
             return self.settings.github_token
         raise RuntimeError("No GitHub credentials: set GITHUB_APP_ID + private key, or GITHUB_TOKEN")
 
     # ---------- API ----------
+    def get_pull(self, repo: str, number: int) -> dict:
+        r = self.http.get(f"/repos/{repo}/pulls/{number}")
+        r.raise_for_status()
+        return r.json()
+
+    def add_reaction(self, repo: str, comment_id: int, content: str = "eyes") -> None:
+        r = self.http.post(f"/repos/{repo}/issues/comments/{comment_id}/reactions", json={"content": content})
+        if r.status_code >= 400:
+            log.warning("Could not react to comment %s: %s", comment_id, r.status_code)
+
+    # ---------- PR status: check run (GitHub App) or commit status (PAT) ----------
+    def start_check(self, repo: str, sha: str) -> int | None:
+        """Mark the review as running. Returns a check-run id, or None when using commit statuses."""
+        try:
+            if self.is_app:
+                r = self.http.post(f"/repos/{repo}/check-runs",
+                                   json={"name": CHECK_NAME, "head_sha": sha, "status": "in_progress"})
+                r.raise_for_status()
+                return r.json()["id"]
+            self._set_status(repo, sha, "pending", "Review in progress…")
+        except httpx.HTTPError as e:
+            log.warning("Could not start PR check: %s", e)
+        return None
+
+    def finish_check(self, repo: str, sha: str, check_id: int | None, conclusion: str, title: str, summary: str):
+        """conclusion: success | failure | neutral"""
+        try:
+            if check_id is not None:
+                r = self.http.patch(f"/repos/{repo}/check-runs/{check_id}", json={
+                    "status": "completed", "conclusion": conclusion,
+                    "output": {"title": title, "summary": summary[:65000]},
+                })
+                r.raise_for_status()
+            elif not self.is_app:
+                self._set_status(repo, sha, STATUS_STATE[conclusion], title)
+        except httpx.HTTPError as e:
+            log.warning("Could not finish PR check: %s", e)
+
+    def _set_status(self, repo: str, sha: str, state: str, description: str):
+        r = self.http.post(f"/repos/{repo}/statuses/{sha}",
+                           json={"state": state, "context": CHECK_NAME, "description": description[:140]})
+        r.raise_for_status()
+
     def list_pr_files(self, repo: str, number: int) -> list[dict]:
         files: list[dict] = []
         page = 1

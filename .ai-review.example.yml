@@ -1,0 +1,16 @@
+# Copy to `.ai-review.yml` in the root of a repo the agent reviews.
+# Every key is optional; anything left out uses the server defaults.
+
+enabled: true            # false = skip reviews for this repo
+min_severity: low        # drop findings below: low | medium | high | critical
+max_comments: 20         # cap inline comments per review (1-100)
+llm_enabled: true        # false = static (AST) analysis only
+fail_on: critical        # PR check fails at/above this severity, or "never"
+
+ignored_paths:           # added to the built-in ignore list (lockfiles, images, dist/...)
+  - "docs/*"
+  - "migrations/*"
+
+instructions: |          # extra guidance for the AI reviewer (max 2000 chars)
+  This is a FastAPI service. Flag blocking I/O inside async endpoints.
+  Don't comment on type hints in tests.

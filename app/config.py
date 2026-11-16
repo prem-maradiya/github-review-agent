@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     max_total_patch_chars: int = 150_000
     max_comments: int = 25
     min_severity: str = "low"  # low | medium | high | critical
+    fail_on: str = "critical"  # PR check fails at/above this severity; "never" to always pass
+    review_instructions: str = ""  # extra guidance for the LLM (set per repo via .ai-review.yml)
+    review_command: str = "/review"
     ignored_paths: list[str] = Field(
         default_factory=lambda: [
             "*.lock", "package-lock.json", "yarn.lock", "poetry.lock",

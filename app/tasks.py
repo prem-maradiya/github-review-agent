@@ -6,6 +6,7 @@ from google.genai import errors as genai_errors
 
 from app.celery_app import celery_app
 from app.config import get_settings
+from app.github_client import GitHubClient
 from app.review_service import review_pull_request
 
 log = logging.getLogger(__name__)
@@ -20,10 +21,26 @@ log = logging.getLogger(__name__)
     retry_backoff_max=300,
     max_retries=5,
 )
-def review_pull_request_task(self, repo: str, number: int, head_sha: str, title: str, body: str,
-                             installation_id: int | None = None) -> dict:
+def review_pull_request_task(self, repo: str, number: int, head_sha: str | None = None, title: str = "",
+                             body: str = "", installation_id: int | None = None,
+                             comment_id: int | None = None) -> dict:
+    """Review a PR. Called from PR events (with head_sha) or the /review command (without)."""
     settings = get_settings()
     r = redis.Redis.from_url(settings.redis_url)
+
+    if head_sha is None:  # /review command: look up the PR's current state
+        gh = GitHubClient(settings, installation_id)
+        try:
+            if comment_id and self.request.retries == 0:
+                gh.add_reaction(repo, comment_id, "eyes")  # acknowledge the command
+            pr = gh.get_pull(repo, number)
+        finally:
+            gh.close()
+        if pr.get("state") != "open":
+            return {"status": "skipped", "reason": "PR is not open"}
+        head_sha, title, body = pr["head"]["sha"], pr.get("title", ""), pr.get("body") or ""
+        r.set(f"pr-head:{repo}#{number}", head_sha, ex=7 * 24 * 3600)
+
     # Only one review per PR at a time; a newer push will enqueue its own task.
     lock = r.lock(f"review-lock:{repo}#{number}", timeout=20 * 60, blocking_timeout=0)
     if not lock.acquire(blocking=False):

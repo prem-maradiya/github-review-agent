@@ -11,6 +11,7 @@ from app.diff_parser import added_lines, commentable_lines
 from app.github_client import GitHubClient
 from app.llm_reviewer import LLMReviewer
 from app.models import SEVERITY_EMOJI, SEVERITY_RANK, FileDiff, Finding, Severity
+from app.repo_config import CONFIG_PATH, apply_repo_config, parse_repo_config
 
 log = logging.getLogger(__name__)
 MARKER = "<!-- ai-code-review-agent -->"
@@ -66,9 +67,26 @@ def format_comment(f: Finding) -> str:
     return body
 
 
-def format_summary(llm_summary: str, findings: list[Finding], files: list[FileDiff], skipped: list[str]) -> str:
+def check_conclusion(findings: list[Finding], fail_on: str) -> tuple[str, str]:
+    """Decide the PR check result. Returns (conclusion, one-line title)."""
     counts = Counter(f.severity for f in findings)
-    lines = [MARKER, "## 🤖 AI Code Review", "", llm_summary or "_No AI summary._", ""]
+    parts = [f"{counts[s]} {s.value}" for s in sorted(counts, key=lambda s: -SEVERITY_RANK[s])]
+    title = ", ".join(parts) if parts else "No issues found"
+    if fail_on != "never":
+        threshold = SEVERITY_RANK[Severity(fail_on)]
+        blocking = sum(n for s, n in counts.items() if SEVERITY_RANK[s] >= threshold)
+        if blocking:
+            return "failure", f"{blocking} issue(s) at or above {fail_on}: {title}"
+    return "success", title
+
+
+def format_summary(llm_summary: str, findings: list[Finding], files: list[FileDiff], skipped: list[str],
+                   config_warning: str | None = None) -> str:
+    counts = Counter(f.severity for f in findings)
+    lines = [MARKER, "## 🤖 AI Code Review", ""]
+    if config_warning:
+        lines += [f"> ⚠️ {config_warning}", ""]
+    lines += [llm_summary or "_No AI summary._", ""]
     lines.append(f"Reviewed **{len(files)}** file(s), left **{len(findings)}** comment(s).")
     if findings:
         lines += ["", "| Severity | Count |", "|---|---|"]
@@ -83,10 +101,20 @@ def format_summary(llm_summary: str, findings: list[Finding], files: list[FileDi
 def review_pull_request(settings: Settings, repo: str, number: int, head_sha: str,
                         title: str, body: str, installation_id: int | None) -> dict:
     gh = GitHubClient(settings, installation_id)
+    check_id, check_started = None, False
     try:
+        # 0) Per-repo overrides from .ai-review.yml at the PR head
+        cfg, config_warning = parse_repo_config(gh.get_file_content(repo, CONFIG_PATH, head_sha))
+        if not cfg.enabled:
+            log.info("Reviews disabled by %s in %s", CONFIG_PATH, repo)
+            return {"status": "skipped", "reason": f"disabled by {CONFIG_PATH}"}
+        settings = apply_repo_config(settings, cfg)
+
+        check_id, check_started = gh.start_check(repo, head_sha), True
         files, skipped = select_files(gh.list_pr_files(repo, number), settings)
         if not files:
             log.info("No reviewable files in %s#%s", repo, number)
+            gh.finish_check(repo, head_sha, check_id, "success", "No reviewable files", "Nothing to review.")
             return {"status": "skipped", "reason": "no reviewable files"}
 
         # 1) Deterministic AST analysis on changed Python files
@@ -105,10 +133,18 @@ def review_pull_request(settings: Settings, repo: str, number: int, head_sha: st
         # 3) Merge, dedupe, rank, and post a single review
         findings = merge_findings(files, ast_findings, llm_findings, settings)
         comments = [{"path": f.path, "line": f.line, "side": "RIGHT", "body": format_comment(f)} for f in findings]
-        summary = format_summary(llm_summary, findings, files, skipped)
+        summary = format_summary(llm_summary, findings, files, skipped, config_warning)
         review = gh.create_review(repo, number, head_sha, summary, comments)
         log.info("Posted review %s on %s#%s with %d comments", review.get("id"), repo, number, len(comments))
+
+        # 4) Report a pass/fail check on the PR
+        conclusion, check_title = check_conclusion(findings, settings.fail_on)
+        gh.finish_check(repo, head_sha, check_id, conclusion, check_title, summary)
         return {"status": "posted", "review_id": review.get("id"), "comments": len(comments),
-                "ast_findings": len(ast_findings), "llm_findings": len(llm_findings)}
+                "ast_findings": len(ast_findings), "llm_findings": len(llm_findings), "check": conclusion}
+    except Exception as e:
+        if check_started:
+            gh.finish_check(repo, head_sha, check_id, "neutral", "Review failed", f"Error: {type(e).__name__}")
+        raise
     finally:
         gh.close()

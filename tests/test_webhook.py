@@ -71,3 +71,31 @@ def test_duplicate_delivery_is_ignored(client):
 def test_ignores_irrelevant_prs(client, payload):
     assert post(client, payload).json()["status"] == "ignored"
     assert client.queued == []
+
+
+# ---------- /review command ----------
+
+def comment_payload(body="/review", association="COLLABORATOR", on_pr=True, sender_type="User"):
+    issue = {"number": 7}
+    if on_pr:
+        issue["pull_request"] = {"url": "https://api.github.com/repos/octo/repo/pulls/7"}
+    return {"action": "created", "installation": {"id": 42}, "repository": {"full_name": "octo/repo"},
+            "issue": issue, "sender": {"type": sender_type},
+            "comment": {"id": 1001, "body": body, "author_association": association}}
+
+
+def test_review_command_queues_review(client):
+    resp = post(client, comment_payload("/review please"), event="issue_comment")
+    assert resp.json() == {"status": "queued", "task_id": "task-123"}
+    assert client.queued[0] == {"repo": "octo/repo", "number": 7, "comment_id": 1001, "installation_id": 42}
+
+
+@pytest.mark.parametrize("payload,reason", [
+    (comment_payload(association="NONE"), "commenter not allowed to trigger reviews"),
+    (comment_payload(body="nice work /review"), "not a review command"),
+    (comment_payload(on_pr=False), "not a new PR comment"),
+    (comment_payload(sender_type="Bot"), "bot comment"),
+])
+def test_review_command_ignored(client, payload, reason):
+    assert post(client, payload, event="issue_comment").json() == {"status": "ignored", "reason": reason}
+    assert client.queued == []

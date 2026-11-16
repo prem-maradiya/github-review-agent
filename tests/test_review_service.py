@@ -1,6 +1,8 @@
+import pytest
+
 from app import review_service
 from app.config import Settings
-from app.models import Finding, Severity
+from app.models import FileDiff, Finding, Severity
 
 PATCH = """@@ -0,0 +1,4 @@
 +def run(cmd):
@@ -11,10 +13,13 @@ CONTENT = "def run(cmd):\n    result = eval(cmd)\n    return result\n"
 
 
 class FakeGitHub:
+    """Records what the pipeline sends to GitHub. Set `repo_config` per test."""
+    repo_config: str | None = None
     posted = None
+    checks: list = []
 
     def __init__(self, settings, installation_id):
-        pass
+        FakeGitHub.checks = []
 
     def list_pr_files(self, repo, number):
         return [
@@ -23,19 +28,28 @@ class FakeGitHub:
         ]
 
     def get_file_content(self, repo, path, ref):
-        return CONTENT
+        return FakeGitHub.repo_config if path == ".ai-review.yml" else CONTENT
 
     def create_review(self, repo, number, commit_id, body, comments):
         FakeGitHub.posted = {"body": body, "comments": comments, "commit_id": commit_id}
         return {"id": 99}
+
+    def start_check(self, repo, sha):
+        FakeGitHub.checks.append(("start", sha))
+        return 555
+
+    def finish_check(self, repo, sha, check_id, conclusion, title, summary):
+        FakeGitHub.checks.append(("finish", check_id, conclusion, title))
 
     def close(self):
         pass
 
 
 class FakeLLM:
+    seen_instructions = None
+
     def __init__(self, settings):
-        pass
+        FakeLLM.seen_instructions = settings.review_instructions
 
     def review(self, title, body, files, hints):
         assert [f.path for f in files] == ["app/run.py"]  # lockfile filtered out
@@ -51,12 +65,21 @@ class FakeLLM:
         ]
 
 
-def test_full_review_pipeline(monkeypatch):
+@pytest.fixture
+def fakes(monkeypatch):
     monkeypatch.setattr(review_service, "GitHubClient", FakeGitHub)
     monkeypatch.setattr(review_service, "LLMReviewer", FakeLLM)
-    settings = Settings(github_webhook_secret="s", github_token="t")
+    FakeGitHub.repo_config = None
+    FakeGitHub.posted = None
+    return Settings(github_webhook_secret="s", github_token="t")
 
-    result = review_service.review_pull_request(settings, "octo/repo", 1, "sha1", "t", "b", None)
+
+def run(settings):
+    return review_service.review_pull_request(settings, "octo/repo", 1, "sha1", "t", "b", None)
+
+
+def test_full_review_pipeline(fakes):
+    result = run(fakes)
 
     assert result["status"] == "posted"
     comments = FakeGitHub.posted["comments"]
@@ -65,12 +88,49 @@ def test_full_review_pipeline(monkeypatch):
     assert "```suggestion\ndef run(cmd: str):\n```" in comments[1]["body"]
     assert "Looks risky." in FakeGitHub.posted["body"]
     assert FakeGitHub.posted["commit_id"] == "sha1"
+    # default fail_on=critical: a high finding still passes
+    assert FakeGitHub.checks[0] == ("start", "sha1")
+    assert FakeGitHub.checks[-1][:3] == ("finish", 555, "success")
+
+
+def test_repo_config_overrides(fakes):
+    FakeGitHub.repo_config = "fail_on: high\nmin_severity: high\ninstructions: Prefer pathlib.\n"
+    result = run(fakes)
+    assert len(FakeGitHub.posted["comments"]) == 1  # medium comment filtered out
+    assert FakeLLM.seen_instructions == "Prefer pathlib."
+    assert result["check"] == "failure"
+    assert FakeGitHub.checks[-1][3].startswith("1 issue(s) at or above high")
+
+
+def test_repo_config_can_disable_reviews(fakes):
+    FakeGitHub.repo_config = "enabled: false\n"
+    assert run(fakes) == {"status": "skipped", "reason": "disabled by .ai-review.yml"}
+    assert FakeGitHub.posted is None and FakeGitHub.checks == []
+
+
+def test_invalid_repo_config_warns_and_uses_defaults(fakes):
+    FakeGitHub.repo_config = "max_comments: lots\n"
+    assert run(fakes)["status"] == "posted"
+    assert "`.ai-review.yml` is invalid" in FakeGitHub.posted["body"]
+
+
+def test_failure_marks_check_neutral(fakes, monkeypatch):
+    monkeypatch.setattr(FakeGitHub, "list_pr_files", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError):
+        run(fakes)
+    assert FakeGitHub.checks[-1][:3] == ("finish", 555, "neutral")
 
 
 def test_min_severity_filter():
     settings = Settings(github_webhook_secret="s", github_token="t", min_severity="high")
-    from app.models import FileDiff
     files = [FileDiff(path="a.py", status="added", patch="", commentable_lines={1, 2})]
     low = Finding(path="a.py", line=1, severity=Severity.low, category="style", title="t", body="b")
     crit = Finding(path="a.py", line=2, severity=Severity.critical, category="security", title="t", body="b")
     assert review_service.merge_findings(files, [low], [crit], settings) == [crit]
+
+
+@pytest.mark.parametrize("fail_on,expected", [("critical", "success"), ("medium", "failure"), ("never", "success")])
+def test_check_conclusion(fail_on, expected):
+    findings = [Finding(path="a.py", line=1, severity=Severity.high, category="bug", title="t", body="b")]
+    assert review_service.check_conclusion(findings, fail_on)[0] == expected
+    assert review_service.check_conclusion([], fail_on) == ("success", "No issues found")

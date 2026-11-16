@@ -1,8 +1,8 @@
 import logging
 
-import anthropic
 import httpx
 import redis
+from google.genai import errors as genai_errors
 
 from app.celery_app import celery_app
 from app.config import get_settings
@@ -14,8 +14,8 @@ log = logging.getLogger(__name__)
 @celery_app.task(
     bind=True,
     name="review_pull_request",
-    autoretry_for=(anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError,
-                   httpx.TransportError),
+    # raised only after every Gemini model was busy/rate-limited, or on network errors
+    autoretry_for=(genai_errors.APIError, httpx.TransportError),
     retry_backoff=True,
     retry_backoff_max=300,
     max_retries=5,

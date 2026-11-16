@@ -1,8 +1,8 @@
 # 🤖 AI Code Review Agent for GitHub
 
-An agent that reviews pull requests on its own. It listens for GitHub webhooks, runs **AST-based static analysis** and an **LLM review (Claude)** on each PR, and posts one review with inline comments on the changed lines.
+An agent that reviews pull requests on its own. It listens for GitHub webhooks, runs **AST-based static analysis** and an **LLM review (Google Gemini, free tier)** on each PR, and posts one review with inline comments on the changed lines.
 
-**Stack:** FastAPI · GitHub Webhooks · Celery · Redis · Claude API (structured outputs) · Python `ast` · Docker
+**Stack:** FastAPI · GitHub Webhooks · Celery · Redis · Google Gemini API (structured outputs) · Python `ast` · Docker
 
 ## Architecture
 
@@ -18,7 +18,7 @@ GitHub PR event ──► FastAPI /webhook/github
                                        │  fetch PR files + patches (GitHub API)
                                        │  filter lockfiles/binaries, enforce size budgets
                                        │  AST analysis on changed .py files (changed lines only)
-                                       │  Claude review on a line-numbered diff + AST hints
+                                       │  Gemini review on a line-numbered diff + AST hints
                                        │  validate lines against the diff, dedupe, rank, cap
                                        ▼
                                   POST /pulls/{n}/reviews  (one review with inline comments)
@@ -32,7 +32,7 @@ GitHub PR event ──► FastAPI /webhook/github
 | `app/github_client.py` | GitHub App (JWT → installation token) or PAT auth; files, contents, reviews |
 | `app/diff_parser.py` | Hunk parsing → commentable/added line numbers; line-numbered patch for the LLM |
 | `app/ast_analyzer.py` | Static checks (see below) |
-| `app/llm_reviewer.py` | Claude call using `messages.parse` + a Pydantic schema |
+| `app/llm_reviewer.py` | Gemini call with a Pydantic `response_schema`, model fallback |
 | `app/review_service.py` | Pipeline orchestration, merging, formatting |
 
 ### AST checks
@@ -41,11 +41,13 @@ Hardcoded secrets · `eval`/`exec` · `shell=True` / `os.system` · `pickle`/uns
 Findings only count when they touch lines the PR **added**, so the bot doesn't flag old code.
 
 ### LLM review
+> On Gemini's free tier, Google may use prompts to improve its products. Use a paid key for private or company code.
+
 - The diff is sent with new-file line numbers (`  42 +code`), so the model cites lines GitHub will accept.
 - The output is checked against a Pydantic schema (`LLMReview`), so there's no fragile JSON parsing.
 - AST findings go in as hints, so the model skips mechanical issues and looks for logic, security and design problems.
 - PR content is treated as untrusted data in the system prompt, as a defence against prompt injection.
-- Server-side refusal fallback is on (`fallbacks="default"`). If a safety classifier declines, the API retries on a fallback model in the same call.
+- If the main model is overloaded or rate-limited (429/5xx), it tries the next model in `LLM_FALLBACK_MODELS`. If all are busy, Celery retries the job with backoff.
 - Any comment whose line isn't in the diff gets dropped. If GitHub still rejects the inline comments (422), the review is posted as summary-only.
 
 ## Setup
@@ -54,7 +56,7 @@ Findings only count when they touch lines the PR **added**, so the bot doesn't f
 ```bash
 cp .env.example .env
 ```
-Fill in `GITHUB_WEBHOOK_SECRET`, `ANTHROPIC_API_KEY`, and one of:
+Fill in `GITHUB_WEBHOOK_SECRET`, `GEMINI_API_KEY` (free from https://aistudio.google.com/apikey), and one of:
 - **GitHub App** (recommended): `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY_PATH`. App permissions: *Pull requests: Read & write*, *Contents: Read*. Subscribe to the **Pull request** event.
 - **PAT**: `GITHUB_TOKEN` (fine-grained, with the same permissions).
 
@@ -94,8 +96,8 @@ The tests cover diff parsing, AST checks, signature verification, webhook filter
 ## Configuration reference
 | Var | Default | Purpose |
 |---|---|---|
-| `LLM_MODEL` | `claude-opus-5-5` | Claude model |
-| `LLM_EFFORT` | `high` | `low`–`max`; lower is cheaper and faster |
+| `LLM_MODEL` | `gemini-3.5-flash` | Main Gemini model |
+| `LLM_FALLBACK_MODELS` | `["gemini-2.5-flash","gemini-3.5-flash-lite"]` | Tried in order when the main model is busy |
 | `LLM_ENABLED` | `true` | `false` = AST-only reviews |
 | `MAX_COMMENTS` | `25` | Cap on inline comments per review |
 | `MIN_SEVERITY` | `low` | Drop findings below this level |

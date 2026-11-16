@@ -1,15 +1,19 @@
-"""LLM-powered review using the Claude API with structured outputs."""
+"""LLM-powered review using Google Gemini with structured (JSON schema) output."""
 from __future__ import annotations
 
 import logging
 
-import anthropic
+from google import genai
+from google.genai import errors, types
 
 from app.config import Settings
 from app.diff_parser import number_patch
 from app.models import FileDiff, Finding, LLMReview
 
 log = logging.getLogger(__name__)
+
+# Errors worth trying the next model for (overloaded / rate-limited)
+RETRYABLE_CODES = {429, 500, 503, 504}
 
 SYSTEM_PROMPT = """You are a senior software engineer doing a code review on a GitHub pull request.
 
@@ -46,42 +50,47 @@ def build_prompt(pr_title: str, pr_body: str, files: list[FileDiff], hints: list
 class LLMReviewer:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key) if settings.anthropic_api_key \
-            else anthropic.Anthropic()
+        # Client also reads GEMINI_API_KEY / GOOGLE_API_KEY from the environment if not passed
+        self.client = genai.Client(api_key=settings.gemini_api_key) if settings.gemini_api_key else genai.Client()
+
+    def _models(self) -> list[str]:
+        return [self.settings.llm_model] + [m for m in self.settings.llm_fallback_models if m != self.settings.llm_model]
 
     def review(self, pr_title: str, pr_body: str, files: list[FileDiff], hints: list[Finding]) -> tuple[str, list[Finding]]:
         prompt = build_prompt(pr_title, pr_body, files, hints)
-        try:
-            response = self.client.beta.messages.parse(
-                model=self.settings.llm_model,
-                max_tokens=self.settings.llm_max_tokens,
-                system=SYSTEM_PROMPT,
-                output_config={"effort": self.settings.llm_effort},
-                # If a safety classifier declines, the API retries on a fallback model in the same call
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
-                messages=[{"role": "user", "content": prompt}],
-                output_format=LLMReview,
-            )
-        except anthropic.RateLimitError:
-            raise  # let Celery retry
-        except anthropic.APIConnectionError:
-            raise
-        except anthropic.APIStatusError as e:
-            if e.status_code >= 500:
-                raise
-            log.error("LLM request rejected (%s): %s", e.status_code, e.message)
-            return f"_AI review unavailable (API error {e.status_code})._", []
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=LLMReview,
+            max_output_tokens=self.settings.llm_max_tokens,
+            temperature=0.2,
+        )
 
-        if response.stop_reason == "refusal":
-            log.warning("LLM refused review: %s", response.stop_details)
-            return "_AI review was declined for this change._", []
-        if response.stop_reason == "max_tokens" or response.parsed_output is None:
-            log.warning("LLM output incomplete (stop_reason=%s)", response.stop_reason)
+        response, last_error = None, None
+        for model in self._models():
+            try:
+                response = self.client.models.generate_content(model=model, contents=prompt, config=config)
+                log.info("Gemini review generated with %s", model)
+                break
+            except errors.APIError as e:
+                if e.code in RETRYABLE_CODES:
+                    log.warning("Model %s unavailable (%s), trying next", model, e.code)
+                    last_error = e
+                    continue
+                log.error("LLM request rejected (%s): %s", e.code, e.message)
+                return f"_AI review unavailable (API error {e.code})._", []
+        if response is None:
+            raise last_error  # every model busy/rate-limited: let Celery retry with backoff
+
+        finish = response.candidates[0].finish_reason.name if response.candidates else "NO_CANDIDATES"
+        result = response.parsed
+        if not isinstance(result, LLMReview):
+            log.warning("LLM output unusable (finish_reason=%s)", finish)
+            if finish in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"}:
+                return "_AI review was blocked by the model's safety filter._", []
             return "_AI review output was incomplete._", []
 
-        result: LLMReview = response.parsed_output
-        log.info("LLM review: %d comments, usage=%s", len(result.comments), response.usage)
+        log.info("LLM review: %d comments, usage=%s", len(result.comments), response.usage_metadata)
         findings = [
             Finding(path=c.path, line=c.line, severity=c.severity, category=c.category,
                     title=c.title, body=c.body, suggestion=c.suggestion, source="llm")

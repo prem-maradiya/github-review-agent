@@ -19,10 +19,10 @@ class Settings(BaseSettings):
     github_api_url: str = "https://api.github.com"
 
     # --- LLM ---
-    anthropic_api_key: str | None = None  # SDK also reads ANTHROPIC_API_KEY itself
-    llm_model: str = "claude-opus-5-5"
-    llm_effort: str = "high"
-    llm_max_tokens: int = 32000
+    gemini_api_key: str | None = None  # SDK also reads GEMINI_API_KEY itself
+    llm_model: str = "gemini-3.5-flash"
+    llm_fallback_models: list[str] = Field(default_factory=lambda: ["gemini-2.5-flash", "gemini-3.5-flash-lite"])
+    llm_max_tokens: int = 16000
     llm_enabled: bool = True
 
     # --- Infra ---
